@@ -167,6 +167,7 @@ def filter_add(server: "Server", request: Request) -> Response:
     bed = server.runtime.bank.add_bed(
         request.str_field("id"), zone, request.float_field("load")
     )
+    server.runtime.backwash.register_bed(bed.id)
     return json_response({"id": bed.id, "zone": bed.zone, "load": bed.load})
 
 
@@ -218,8 +219,40 @@ def filter_zone(server: "Server", request: Request) -> Response:
 
 def backwash_start(server: "Server", request: Request) -> Response:
     bed_id = request.str_field("id")
-    server.runtime.backwash.start(bed_id)
-    return json_response({"started": bed_id})
+    request_id = request.str_field("request_id", "")
+    run = server.runtime.backwash.start(bed_id, request_id=request_id)
+    return json_response({"started": bed_id, "run": run})
+
+
+def backwash_poll(server: "Server", request: Request) -> Response:
+    bed_id = request.str_field("id", "")
+    run = server.runtime.backwash.poll(bed_id)
+    return json_response({"run": run})
+
+
+def backwash_abort(server: "Server", request: Request) -> Response:
+    bed_id = request.str_field("id")
+    reason = request.str_field("reason", "operator abort")
+    run = server.runtime.backwash.abort(bed_id, reason=reason)
+    return json_response({"aborted": bed_id, "run": run})
+
+
+def backwash_safety(server: "Server", request: Request) -> Response:
+    runtime = server.runtime
+    level = request.float_field("level", runtime.backwash.safety_level())
+    if level < 0:
+        raise ValueError("safety level must be non-negative")
+    runtime.backwash.set_safety_level(level)
+    return json_response(
+        {
+            "safety_level": runtime.backwash.safety_level(),
+            "clearwell_level": runtime.well.level(),
+        }
+    )
+
+
+def backwash_history(server: "Server", request: Request) -> Response:
+    return json_response({"history": server.runtime.backwash.history()})
 
 
 def backwash_order(server: "Server", request: Request) -> Response:
@@ -241,8 +274,8 @@ def backwash_enqueue(server: "Server", request: Request) -> Response:
 
 
 def backwash_recover(server: "Server", request: Request) -> Response:
-    server.runtime.backwash.recover()
-    return json_response({"recovered": True})
+    run = server.runtime.backwash.recover()
+    return json_response({"recovered": True, "run": run})
 
 
 def backwash_replay(server: "Server", request: Request) -> Response:

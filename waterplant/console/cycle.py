@@ -39,8 +39,12 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
     min_level = rt.well.adjust_level(level, rt.inlet, rt.outlet)
     rotation = rt.backwash.order_rotation()
     duty = rt.bank.on_duty()
+    wash_status = ""
+    wash_step = ""
     if bed_id:
-        rt.backwash.start(bed_id)
+        run = rt.backwash.start(bed_id)
+        wash_status = str(run.get("status", ""))
+        wash_step = str(run.get("step", ""))
     quota_value = rt.accumulator.add(amount)
 
     return json_response(
@@ -54,6 +58,8 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
             "rotation": rotation,
             "on_duty": duty or "",
             "backwash": bed_id,
+            "backwash_status": wash_status,
+            "backwash_step": wash_step,
             "drains": rt.backwash.drain_count(),
             "audit_count": rt.auditor.count(),
             "ph_stable": ph_verdict.stable,

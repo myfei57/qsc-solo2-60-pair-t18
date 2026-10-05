@@ -16,8 +16,8 @@ from .runtime import Runtime
 class Server:
     """Owns the runtime state and dispatches console requests."""
 
-    def __init__(self, store: Store) -> None:
-        self.runtime = Runtime(store)
+    def __init__(self, store: Store, **runtime_options: object) -> None:
+        self.runtime = Runtime(store, **runtime_options)
         self.router = Router()
         self.metrics = Metrics()
         register_routes(self.router, handlers)

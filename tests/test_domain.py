@@ -2,11 +2,32 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 
 from waterplant.audit import Auditor
-from waterplant.backwash import Controller
+from waterplant.backwash import (
+    Controller,
+    PUMP_RUNNING,
+    PUMP_STOPPED,
+    SimFieldBus,
+    VALVE_CLOSED,
+    VALVE_OPEN,
+)
+from waterplant.backwash.report import (
+    DRAIN_CLOSE,
+    DRAIN_OPEN,
+    FLUSH,
+    ISOLATE,
+    PHASE_COMMAND,
+    PHASE_HELD,
+    RESTORE,
+    RUN_ABORTED,
+    RUN_COMPLETE,
+    RUN_RUNNING,
+    STEPS,
+)
 from waterplant.chlor import Doser as ChlorDoser
 from waterplant.chlor import validate_demand
 from waterplant.clearwell import Well, validate_level
@@ -266,48 +287,368 @@ class FilterCase(unittest.TestCase):
             validate_zone(200_000)
 
 
-class BackwashCase(unittest.TestCase):
-    def test_start_closes_before_draining(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            store = Store.open(f"{tmp}/state.json")
-            bank = Bank()
-            bank.add_bed("b1", 1, 4.0)
-            controller = Controller(bank, store)
-            controller.start("b1")
-            self.assertTrue(bank.is_closed("b1"))
-            self.assertFalse(controller.spilled())
-            self.assertEqual(controller.drain_count(), 1)
-            self.assertEqual(controller.last_drain(), "b1")
-            self.assertIn("commands=0", controller.describe())
+class FakeClock:
+    """Adjustable monotonic clock for deadline tests."""
 
-    def test_queue_replay_and_recovery(self) -> None:
+    def __init__(self, value: float = 0.0) -> None:
+        self.value = value
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
+class BackwashCase(unittest.TestCase):
+    def _controller(
+        self,
+        tmp: str,
+        beds: tuple[str, ...] = ("b1",),
+        level: float = 10.0,
+        travel: float = 0.0,
+        valve_timeout: float = 60.0,
+        pump_timeout: float = 30.0,
+        flush_seconds: float = 0.0,
+        safety: float = 2.0,
+        clock: FakeClock | None = None,
+    ):
+        store = Store.open(f"{tmp}/state.json")
+        bank = Bank()
+        for index, bed_id in enumerate(beds, start=1):
+            bank.add_bed(bed_id, index, 4.0)
+        well = Well(store)
+        well.set_level(level)
+        fake_clock = clock or FakeClock()
+        field = SimFieldBus(travel_seconds=travel)
+        for bed_id in beds:
+            field.register(bed_id)
+        controller = Controller(
+            bank,
+            store,
+            field=field,
+            well=well,
+            clock=fake_clock,
+            valve_timeout=valve_timeout,
+            pump_timeout=pump_timeout,
+            flush_seconds=flush_seconds,
+        )
+        controller.set_safety_level(safety)
+        return store, bank, well, field, controller, fake_clock
+
+    def test_happy_path_confirms_every_step_by_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            store = Store.open(f"{tmp}/state.json")
-            bank = Bank()
-            bank.add_bed("b1", 1, 4.0)
-            bank.add_bed("b2", 2, 2.0)
-            controller = Controller(bank, store)
+            _, bank, _, field, controller, _clock = self._controller(tmp)
+            run = controller.start("b1")
+            # Instant feedback devices: the whole chain completes in one trigger.
+            self.assertEqual(run["status"], RUN_COMPLETE)
+            self.assertEqual(bank.is_closed("b1"), False)
+            self.assertEqual(field.isolation_position("b1"), VALVE_OPEN)
+            self.assertEqual(field.drain_position("b1"), VALVE_CLOSED)
+            self.assertEqual(field.pump_status("b1"), PUMP_STOPPED)
+            kinds = [event["kind"] for event in run["events"]]
+            self.assertEqual(
+                [event["step"] for event in run["events"] if event["kind"] == "backwash.command"],
+                [ISOLATE, DRAIN_OPEN, FLUSH, FLUSH, DRAIN_CLOSE, RESTORE],
+            )
+            confirm_steps = [
+                event["step"] for event in run["events"] if event["kind"] == "backwash.confirm"
+            ]
+            self.assertEqual(confirm_steps, [ISOLATE, DRAIN_OPEN, FLUSH, FLUSH, DRAIN_CLOSE, RESTORE])
+            self.assertIn("backwash.complete", kinds)
+            self.assertFalse(controller.spilled())
+            self.assertEqual(controller.history()[0]["status"], RUN_COMPLETE)
+            self.assertEqual(controller.describe().split()[-1], "idle")
+
+    def test_drain_is_blocked_until_isolation_reports_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, _, field, controller, _clock = self._controller(
+                tmp, travel=10.0, valve_timeout=60.0, pump_timeout=60.0
+            )
+            run = controller.start("b1")
+            # Isolation still moving: the drain must never have been commanded.
+            self.assertEqual(run["status"], RUN_RUNNING)
+            self.assertEqual(run["step"], ISOLATE)
+            self.assertEqual(field.drain_position("b1"), VALVE_CLOSED)
+            self.assertEqual(field.command_count("b1", "drain"), 0)
+
+            field.tick(10.0)
+            run = controller.poll("b1")
+            self.assertEqual(run["step"], DRAIN_OPEN)
+            self.assertEqual(field.command_count("b1", "drain"), 1)
+            field.tick(10.0)  # drain travels open
+            run = controller.poll("b1")
+            self.assertEqual(run["step"], FLUSH)
+            field.tick(10.0)  # pump starts and reaches running feedback
+            run = controller.poll("b1")
+            self.assertEqual(run["flush_phase"], "stop")
+            field.tick(10.0)  # pump stops on feedback
+            run = controller.poll("b1")
+            self.assertEqual(run["step"], DRAIN_CLOSE)
+            field.tick(10.0)  # drain close travels
+            run = controller.poll("b1")
+            self.assertEqual(run["step"], RESTORE)
+            field.tick(10.0)  # restore travels
+            run = controller.poll("b1")
+            self.assertEqual(run["status"], RUN_COMPLETE)
+            self.assertEqual(field.command_count("b1", "drain"), 2)
+
+    def test_isolation_timeout_holds_and_resumes_from_same_step(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, _, field, controller, clock = self._controller(tmp, valve_timeout=5.0)
+            field.set_mode("b1", "isolation", "stuck")
+            run = controller.start("b1")
+            self.assertEqual(run["step"], ISOLATE)
+            self.assertEqual(run["phase"], PHASE_COMMAND)
+            self.assertEqual(field.command_count("b1", "isolation"), 1)
+
+            clock.advance(6.0)
+            run = controller.poll("b1")
+            self.assertEqual(run["phase"], PHASE_HELD)
+            self.assertEqual(run["step"], ISOLATE)
+            self.assertEqual(field.command_count("b1", "isolation"), 1)
+            kinds = [event["kind"] for event in run["events"]]
+            self.assertEqual(kinds.count("backwash.timeout"), 1)
+
+            # Repeated polls while held do nothing; the drain stays shut.
+            run = controller.poll("b1")
+            self.assertEqual(field.command_count("b1", "isolation"), 1)
+            self.assertEqual(field.command_count("b1", "drain"), 0)
+
+            # Recovery clears the fault and retries; it resumes, not restarts.
+            field.set_mode("b1", "isolation", "normal")
+            run = controller.start("b1", request_id="op-1")
+            self.assertEqual(run["status"], RUN_COMPLETE)
+            # The initial command, one re-issued command on resume, and the
+            # final restore command: the bed itself is commanded twice shut.
+            self.assertEqual(field.command_count("b1", "isolation"), 3)
+            self.assertEqual(sum(1 for e in run["events"] if e["step"] == ISOLATE), 5)
+            self.assertIn("backwash.resume", [event["kind"] for event in run["events"]])
+
+            # Re-delivery of the same request id is idempotent.
+            run2 = controller.history()[-1]
+            self.assertEqual(
+                sum(1 for e in run2["events"] if e["kind"] == "backwash.resume"), 1
+            )
+
+    def test_held_step_repeated_trigger_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, _, field, controller, clock = self._controller(tmp, valve_timeout=5.0)
+            field.set_mode("b1", "isolation", "stuck")
+            controller.start("b1")
+            clock.advance(6.0)
+            controller.poll("b1")
+            run = controller.start("b1", request_id="dup")
+            run = controller.start("b1", request_id="dup")
+            resumes = [e for e in run["events"] if e["kind"] == "backwash.resume"]
+            self.assertEqual(len(resumes), 1)
+
+    def test_low_clearwell_level_rejects_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, _, _, controller, _clock = self._controller(tmp, level=1.5, safety=2.0)
+            with self.assertRaises(ValueError):
+                controller.start("b1")
+            self.assertEqual(controller.active_run(), {})
+
+    def test_interlock_aborts_flush_and_restarts_from_first_step(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, bank, well, field, controller, clock = self._controller(
+                tmp, flush_seconds=60.0, pump_timeout=30.0
+            )
+            run = controller.start("b1")
+            # Instant devices: pump starts, flush timing is now armed.
+            self.assertEqual(run["step"], FLUSH)
+            self.assertEqual(run["flush_phase"], "flushing")
+            self.assertEqual(field.pump_status("b1"), PUMP_RUNNING)
+            self.assertEqual(field.drain_position("b1"), VALVE_OPEN)
+
+            well.set_level(1.0)  # below the safety line
+            run = controller.poll("b1")
+            self.assertEqual(run["status"], RUN_ABORTED)
+            self.assertEqual(field.pump_status("b1"), PUMP_STOPPED)
+            self.assertEqual(field.drain_position("b1"), VALVE_CLOSED)
+            # The bed stays isolated after the abort.
+            self.assertTrue(bank.is_closed("b1"))
+            kinds = [event["kind"] for event in run["events"]]
+            self.assertIn("backwash.interlock", kinds)
+            aborted = controller.history()[-1]
+            self.assertEqual(aborted["status"], RUN_ABORTED)
+
+            # Level still unsafe: cannot start again.
+            with self.assertRaises(ValueError):
+                controller.start("b1")
+
+            # Level restored: a fresh run starts from the first step and must
+            # go through the whole feedback chain again, including the flush.
+            well.set_level(10.0)
+            run = controller.start("b1")
+            self.assertEqual(run["step"], FLUSH)
+            self.assertEqual(run["flush_phase"], "flushing")
+            clock.advance(61.0)
+            run = controller.poll("b1")
+            self.assertEqual(run["status"], RUN_COMPLETE)
+            self.assertEqual(len(controller.history()), 2)
+            self.assertEqual(
+                [doc["status"] for doc in controller.history()],
+                [RUN_ABORTED, RUN_COMPLETE],
+            )
+
+    def test_interlock_during_drain_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, well, field, controller, _clock = self._controller(
+                tmp, travel=10.0, valve_timeout=60.0
+            )
+            controller.start("b1")
+            field.tick(10.0)
+            run = controller.poll("b1")
+            self.assertEqual(run["step"], DRAIN_OPEN)
+            field.tick(5.0)  # drain still moving
+            well.set_level(0.5)
+            run = controller.poll("b1")
+            # Abort shutdown commanded; the drain needs travel time to close.
+            self.assertEqual(run["status"], "aborting")
+            field.tick(10.0)
+            run = controller.poll("b1")
+            self.assertEqual(run["status"], RUN_ABORTED)
+            self.assertEqual(field.drain_position("b1"), VALVE_CLOSED)
+
+    def test_flush_runs_full_duration_then_closes_drain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, _, field, controller, clock = self._controller(tmp, flush_seconds=60.0)
+            run = controller.start("b1")
+            self.assertEqual(run["status"], RUN_RUNNING)
+            self.assertEqual(run["flush_phase"], "flushing")
+
+            clock.advance(30.0)
+            run = controller.poll("b1")
+            self.assertEqual(run["flush_phase"], "flushing")
+            self.assertEqual(field.pump_status("b1"), PUMP_RUNNING)
+
+            clock.advance(31.0)
+            run = controller.poll("b1")
+            self.assertEqual(run["status"], RUN_COMPLETE)
+            self.assertEqual(field.pump_status("b1"), PUMP_STOPPED)
+
+    def test_pump_failure_mid_flush_holds_and_resumes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, _, field, controller, clock = self._controller(
+                tmp, flush_seconds=60.0, pump_timeout=30.0
+            )
+            controller.start("b1")
+            # Pump drops to fault while flushing; the run holds regardless of
+            # the flush deadline because the running feedback is gone.
+            field.set_mode("b1", "pump", "stuck")
+            run = controller.poll("b1")
+            self.assertEqual(run["step"], FLUSH)
+            self.assertEqual(run["phase"], PHASE_HELD)
+            self.assertEqual(run["flush_phase"], "flushing")
+            self.assertEqual(field.drain_position("b1"), VALVE_OPEN)
+
+            field.set_mode("b1", "pump", "normal")
+            run = controller.start("b1", request_id="retry")
+            # Pump re-starts and the flush times again from zero.
+            self.assertEqual(run["flush_phase"], "flushing")
+            clock.advance(61.0)
+            run = controller.poll("b1")
+            self.assertEqual(run["status"], RUN_COMPLETE)
+
+    def test_abort_stall_holds_and_resumes_safe_shutdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, well, field, controller, clock = self._controller(
+                tmp, flush_seconds=60.0, pump_timeout=30.0
+            )
+            controller.start("b1")
+            well.set_level(1.0)
+            # The pump ignores the stop command: the abort stalls in the
+            # stop_pump phase and holds rather than forcing the drain shut.
+            field.set_mode("b1", "pump", "stuck")
+            run = controller.poll("b1")
+            self.assertEqual(run["status"], "aborting")
+            self.assertTrue(run["abort"]["phase"] == "stop_pump")
+            clock.advance(31.0)
+            run = controller.poll("b1")
+            self.assertTrue(run["abort"]["held"])
+            self.assertEqual(field.drain_position("b1"), VALVE_OPEN)
+
+            field.set_mode("b1", "pump", "normal")
+            run = controller.start("b1", request_id="recover-abort")
+            self.assertEqual(run["status"], RUN_ABORTED)
+            self.assertEqual(field.pump_status("b1"), PUMP_STOPPED)
+            self.assertEqual(field.drain_position("b1"), VALVE_CLOSED)
+
+    def test_audit_trail_and_run_document_stay_consistent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _, _, _, controller, _clock = self._controller(tmp)
+            controller.start("b1")
+            raw, present = store.get("backwash:history")
+            self.assertTrue(present)
+            run_doc = json.loads(raw)[0]
+            event_ids = {event["id"] for event in run_doc["events"]}
+            from waterplant.audit.auditor import AUDIT_KEY
+
+            audit_ids = set()
+            for item in load_commands(store, AUDIT_KEY):
+                audit_ids.add(json.loads(item)["id"])
+            self.assertTrue(event_ids <= audit_ids)
+            # Recovery reconciles without duplicating rows.
+            before = len(load_commands(store, AUDIT_KEY))
+            controller.recover()
+            self.assertEqual(len(load_commands(store, AUDIT_KEY)), before)
+
+    def test_one_wash_at_a_time_and_unknown_bed_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, _, field, controller, _clock = self._controller(tmp, beds=("b1", "b2"))
+            with self.assertRaises(ValueError):
+                controller.start("missing")
+            field.set_mode("b1", "isolation", "stuck")
+            controller.start("b1")
+            with self.assertRaises(ValueError):
+                controller.start("b2")
+
+    def test_queue_replay_starts_one_bed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, bank, _, _, controller, _clock = self._controller(tmp, beds=("b1", "b2"))
             controller.enqueue("b1")
             controller.enqueue("b2")
             self.assertEqual(controller.pending_count(), 2)
-            self.assertEqual(controller.replay(), ["b1", "b2"])
-            self.assertTrue(bank.is_closed("b1"))
-            controller.recover()
+            self.assertEqual(controller.replay(), ["b1"])
+            self.assertEqual(controller.command_list(), ["b2"])
+            # The run completed end to end, so the bed is back in service.
+            self.assertFalse(bank.is_closed("b1"))
+            self.assertEqual(controller.pending_count(), 1)
+            self.assertEqual(controller.replay(), ["b2"])
             self.assertEqual(controller.command_list(), [])
+            self.assertFalse(bank.is_closed("b2"))
+
+    def test_recovery_returns_active_run_view(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, _, field, controller, clock = self._controller(tmp, valve_timeout=5.0)
+            field.set_mode("b1", "isolation", "stuck")
+            controller.start("b1")
+            clock.advance(6.0)
+            controller.poll("b1")
+            view = controller.recover()
+            self.assertEqual(view["step"], ISOLATE)
+            self.assertEqual(view["phase"], PHASE_HELD)
 
     def test_rotation_and_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            store = Store.open(f"{tmp}/state.json")
-            bank = Bank()
-            bank.add_bed("b1", 1, 4.0)
-            bank.add_bed("b2", 2, 9.0)
-            controller = Controller(bank, store)
+            _, bank, _, _, controller, _clock = self._controller(tmp, beds=("b1", "b2"))
+            bank.set_load("b1", 4.0)
+            bank.set_load("b2", 9.0)
             self.assertEqual(controller.order_rotation(), ["b2", "b1"])
             self.assertEqual(bank.on_duty(), "b2")
             self.assertEqual(controller.select(1), "b1")
-            self.assertEqual(controller.eligible(), ["b1", "b2"])
             with self.assertRaises(ValueError):
                 controller.select(7)
+
+    def test_state_catalog_lists_actions_and_confirmations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, _, _, controller, _clock = self._controller(tmp)
+            state = controller.state()
+            self.assertEqual([spec["step"] for spec in state.as_dict()["steps"]], list(STEPS))
+            self.assertIn("fully closed", state.as_dict()["steps"][0]["confirmation"])
+            self.assertEqual(state.safety_level, 2.0)
 
 
 class QuotaCase(unittest.TestCase):

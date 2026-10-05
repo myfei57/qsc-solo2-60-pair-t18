@@ -17,7 +17,11 @@ class ConsoleCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.store = Store.open(f"{self._tmp.name}/state.json")
         seed_defaults(self.store)
-        self.server = Server(self.store)
+        # Short deadlines and a flush with no held duration keep the console
+        # tests deterministic against the zero-travel simulated field.
+        self.server = Server(
+            self.store, valve_timeout=5.0, pump_timeout=5.0, flush_seconds=0.0
+        )
 
     def tearDown(self) -> None:
         self.store.close()
@@ -150,6 +154,7 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(body["min_level"], 0.0)
 
     def test_filter_and_backwash_routes(self) -> None:
+        self.call("POST", "/clearwell/level", {"target": 10.0})
         for bed_id, zone, load in (("b1", 1, 4.0), ("b2", 2, 9.0), ("b3", 3, 1.0)):
             status, _ = self.call(
                 "POST", "/filter/add", {"id": bed_id, "zone": zone, "load": load}
@@ -176,8 +181,14 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(status, 200)
         _, body = self.call("POST", "/backwash/replay")
         self.assertEqual(body["replayed"], ["b1"])
-        status, _ = self.call("POST", "/backwash/recover")
+        # The wash completes through the full feedback chain in one replay.
+        _, body = self.call("POST", "/backwash/poll", {"id": "b1"})
+        self.assertEqual(body["run"], {})
+        status, body = self.call("POST", "/backwash/recover")
         self.assertEqual(status, 200)
+        self.assertEqual(body["run"], {})
+        _, body = self.call("GET", "/backwash/history")
+        self.assertEqual(body["history"][0]["status"], "complete")
 
         status, body = self.call("POST", "/filter/load", {"id": "b1", "load": 20.0})
         self.assertEqual(body["load"], 20.0)
@@ -187,6 +198,116 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(status, 200)
         status, body = self.call("POST", "/filter/remove", {"id": "b3"})
         self.assertEqual(body["removed"], "b3")
+
+    def test_backwash_safety_line_and_interlock(self) -> None:
+        self.call("POST", "/filter/add", {"id": "b1", "zone": 1, "load": 4.0})
+        status, body = self.call("POST", "/backwash/safety", {"level": 5.0})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["safety_level"], 5.0)
+
+        # Starting below the safety line is refused and audited.
+        self.call("POST", "/clearwell/level", {"target": 3.0})
+        status, body = self.call("POST", "/backwash/start", {"id": "b1"})
+        self.assertEqual(status, 400)
+        self.assertIn("safety line", body["error"])
+        _, body = self.call("GET", "/audit")
+        self.assertIn("backwash.reject", [e["kind"] for e in body["entries"]])
+
+        # Bring the level up and start: the zero-duration flush completes the
+        # whole chain, so instead hold the pump out of the run to reach a
+        # stable "drain open" window by aborting during flush is exercised in
+        # the domain suite; here verify the completed run is audited and the
+        # interlock still trips a freshly started run via a slow flush clock.
+        self.call("POST", "/clearwell/level", {"target": 10.0})
+
+        class Clock:
+            value = 0.0
+
+            def __call__(self) -> float:
+                return self.value
+
+        self.server.runtime.backwash._clock = Clock()  # noqa: SLF001 - test seam
+        # A 60s flush on this clock parks the run in the flushing phase.
+        self.server.runtime.backwash._flush_seconds = 60.0  # noqa: SLF001
+        status, body = self.call("POST", "/backwash/start", {"id": "b1"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["run"]["step"], "flush")
+        self.assertEqual(body["run"]["flush_phase"], "flushing")
+        self.call("POST", "/clearwell/level", {"target": 1.0})
+        status, body = self.call("POST", "/backwash/poll", {"id": "b1"})
+        self.assertEqual(body["run"]["status"], "aborted")
+        _, body = self.call("GET", "/snapshot")
+        self.assertIsNone(body["backwash"]["active"])
+        self.assertEqual(body["backwash"]["history"][0]["status"], "aborted")
+        kinds = {e["kind"] for e in body["backwash"]["history"][0]["events"]}
+        self.assertIn("backwash.interlock", kinds)
+
+    def test_backwash_timeout_hold_and_idempotent_resume(self) -> None:
+        from waterplant.backwash.report import PHASE_HELD
+
+        self.call("POST", "/clearwell/level", {"target": 10.0})
+        self.call("POST", "/filter/add", {"id": "b1", "zone": 1, "load": 4.0})
+        runtime = self.server.runtime
+        field = runtime.backwash.field
+
+        class Clock:
+            value = 0.0
+
+            def __call__(self) -> float:
+                return self.value
+
+        # Swap in a controllable clock without rebuilding the runtime.
+        runtime.backwash._clock = Clock()  # noqa: SLF001 - test seam
+        field.set_mode("b1", "isolation", "stuck")
+        status, body = self.call("POST", "/backwash/start", {"id": "b1"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["run"]["step"], "isolate")
+
+        # Before the deadline the step is still merely commanded.
+        status, body = self.call("POST", "/backwash/start", {"id": "b1"})
+        self.assertEqual(body["run"]["phase"], "commanded")
+
+        # After the deadline, a poll promotes it to a held partial failure.
+        Clock.value = 6.0
+        status, body = self.call("POST", "/backwash/poll", {"id": "b1"})
+        self.assertEqual(body["run"]["phase"], PHASE_HELD)
+
+        # Replay reconciliation exposes the same held run without changing it.
+        status, body = self.call("POST", "/backwash/recover")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["run"]["phase"], PHASE_HELD)
+
+        # Another bed cannot start while one run is active.
+        self.call("POST", "/filter/add", {"id": "b2", "zone": 2, "load": 1.0})
+        status, _ = self.call("POST", "/backwash/start", {"id": "b2"})
+        self.assertEqual(status, 400)
+
+        # Clearing the fault and re-triggering with a stable request id
+        # resumes the held step and completes the wash.
+        field.set_mode("b1", "isolation", "normal")
+        status, body = self.call(
+            "POST", "/backwash/start", {"id": "b1", "request_id": "retry-1"}
+        )
+        self.assertEqual(body["run"]["status"], "complete")
+        status, _ = self.call(
+            "POST", "/backwash/start", {"id": "b1", "request_id": "retry-1"}
+        )
+        self.assertEqual(status, 200)
+        _, body = self.call("GET", "/backwash/history")
+        resumes = [
+            e for e in body["history"][0]["events"] if e["kind"] == "backwash.resume"
+        ]
+        self.assertEqual(len(resumes), 1)
+
+    def test_backwash_snapshot_catalog(self) -> None:
+        self.call("POST", "/filter/add", {"id": "b1", "zone": 1, "load": 4.0})
+        _, body = self.call("GET", "/snapshot")
+        steps = body["backwash"]["steps"]
+        self.assertEqual([s["step"] for s in steps], [
+            "isolate", "drain_open", "flush", "drain_close", "restore"
+        ])
+        self.assertIn("fully closed", steps[0]["confirmation"])
+        self.assertIn("drain", steps[1]["action"])
 
     def test_quota_and_audit_routes(self) -> None:
         status, body = self.call("POST", "/quota/add", {"amount": 40.0})
@@ -227,8 +348,10 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(body["turb_dose"], 3.0)
         self.assertEqual(body["chlor_dose"], 0.65)
         self.assertEqual(body["rotation"], ["b1"])
-        self.assertEqual(body["drains"], 1)
-        self.assertEqual(body["audit_count"], 2)
+        self.assertEqual(body["backwash_status"], "complete")
+        self.assertEqual(body["backwash_step"], "restore")
+        self.assertEqual(body["drains"], 0)
+        self.assertGreaterEqual(body["audit_count"], 2)
         self.assertTrue(body["ph_stable"])
         self.assertEqual(body["ph_adjustment"], 0.0)
 

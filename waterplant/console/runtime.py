@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 from waterplant.audit import Auditor
 from waterplant.backwash import Controller
 from waterplant.chlor import Doser as ChlorDoser
@@ -21,7 +23,15 @@ from waterplant.turb import Sampler
 class Runtime:
     """Owns one instance of each control component for a single store."""
 
-    def __init__(self, store: Store) -> None:
+    def __init__(
+        self,
+        store: Store,
+        field: object | None = None,
+        clock: Callable[[], float] | None = None,
+        valve_timeout: float | None = None,
+        pump_timeout: float | None = None,
+        flush_seconds: float | None = None,
+    ) -> None:
         bank = Bank()
         coag_doser = CoagDoser(store)
         self.store = store
@@ -31,10 +41,21 @@ class Runtime:
         self.coag_doser = coag_doser
         self.chlor_doser = ChlorDoser(store)
         self.bank = bank
-        self.backwash = Controller(bank, store)
+        self.well = Well(store)
+        kwargs: dict[str, object] = {"well": self.well}
+        if field is not None:
+            kwargs["field"] = field
+        if clock is not None:
+            kwargs["clock"] = clock
+        if valve_timeout is not None:
+            kwargs["valve_timeout"] = valve_timeout
+        if pump_timeout is not None:
+            kwargs["pump_timeout"] = pump_timeout
+        if flush_seconds is not None:
+            kwargs["flush_seconds"] = flush_seconds
+        self.backwash = Controller(bank, store, **kwargs)
         self.sampler = Sampler(coag_doser)
         self.calibration = Calibration(store)
-        self.well = Well(store)
         self.accumulator = Accumulator(store)
         self.auditor = Auditor(store)
         self.stabilizer = Stabilizer(store)
