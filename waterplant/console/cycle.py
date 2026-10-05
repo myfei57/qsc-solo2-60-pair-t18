@@ -40,6 +40,7 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
     rotation = rt.backwash.order_rotation()
     duty = rt.bank.on_duty()
     if bed_id:
+        rt.field.pump()
         rt.backwash.start(bed_id)
     quota_value = rt.accumulator.add(amount)
 

@@ -1,8 +1,11 @@
-"""Backwash controller.
+"""Backwash controller facade.
 
-Every backwash follows the same sequence: the bed is closed first, then the
-drain is opened for it. The command queue is persisted so an interrupted
-console can replay or discard pending work.
+The legacy surface (command queue, duty rotation, drain markers) is retained for
+the console, but starting a wash no longer fires commands in call order. It
+delegates to the feedback-gated :class:`Sequencer`: the bed is proven isolated
+before the drain opens, every step needs matching feedback before the next one
+is allowed to move, watchdog failures freeze the run in place, and a clearwell
+below its safe level refuses or trips the wash.
 """
 
 from __future__ import annotations
@@ -11,45 +14,100 @@ from waterplant.filter import Bank
 from waterplant.store.commands import append_command, clear_commands, load_commands
 from waterplant.store.store import Store
 
-from .report import BackwashState
-from .schedule import now_unix
+from .clock import Clock
+from .field import Field, SimulatedField
+from .report import BackwashState, IDLE
+from .sequencer import (
+    DEFAULT_CLEARWELL_SAFE_LEVEL,
+    DRAIN_KEY_PREFIX,
+    SPILL_KEY,
+    RunState,
+    Sequencer,
+)
 
 COMMAND_KEY = "backwash:commands"
-DRAIN_KEY_PREFIX = "backwash:drain:"
-SPILL_KEY = "backwash:spill"
 
 
 class Controller:
-    """Sequences backwash commands against the filter bank."""
+    """Sequences backwash work against the filter bank via the safe sequencer."""
 
-    def __init__(self, bank: Bank, store: Store) -> None:
+    def __init__(
+        self,
+        bank: Bank,
+        store: Store,
+        field: Field | None = None,
+        clock: Clock | None = None,
+        safe_level: float = DEFAULT_CLEARWELL_SAFE_LEVEL,
+    ) -> None:
         self._bank = bank
         self._store = store
+        self._field = field if field is not None else SimulatedField()
+        self.sequencer = Sequencer(
+            bank, self._field, store, clock=clock, safe_level=safe_level
+        )
 
-    def start(self, bed_id: str) -> None:
-        """Close the bed and only then open its drain."""
+    # -- safe sequencing ---------------------------------------------------
 
-        self._bank.close(bed_id)
-        self._drain(bed_id)
+    def start(self, bed_id: str) -> RunState:
+        """Begin (or idempotently return) the feedback-gated run for a bed."""
 
-    def _drain(self, bed_id: str) -> None:
-        if not self._bank.is_closed(bed_id):
-            self._store.put(SPILL_KEY, "true")
-        self._store.put(f"{DRAIN_KEY_PREFIX}{bed_id}", str(now_unix()))
+        return self.sequencer.begin(bed_id)
+
+    def pulse(self) -> RunState:
+        return self.sequencer.pulse()
+
+    def resume(self) -> RunState:
+        return self.sequencer.resume()
+
+    def resume_abort(self) -> RunState:
+        return self.sequencer.resume_abort()
+
+    def reset(self) -> None:
+        self.sequencer.reset()
+
+    def status(self) -> str:
+        return self.sequencer.status()
+
+    def active_run(self) -> RunState | None:
+        return self.sequencer.active_run()
+
+    def journal(self, run_id: str | None = None) -> list[dict[str, object]]:
+        return self.sequencer.journal(run_id)
+
+    def run_history(self) -> list[dict[str, object]]:
+        return self.sequencer.run_history()
+
+    def safe_level(self) -> float:
+        return self.sequencer.safe_level()
+
+    def field(self) -> Field:
+        return self._field
+
+    # -- queued work (operator requests, never blindly re-issued) ----------
 
     def enqueue(self, bed_id: str) -> None:
         append_command(self._store, COMMAND_KEY, bed_id)
 
     def replay(self) -> list[str]:
-        """Re-run every queued command in the order it was written."""
+        """Start a safe run for the queued beds, one wash at a time.
+
+        Only one bed may be washed at a time, so queued ids are *requests*: the
+        first free bed begins its feedback-gated run and the rest remain queued
+        until it completes. The returned list is what was still outstanding
+        before this call.
+        """
 
         commands = self.command_list()
-        for bed_id in commands:
-            self.start(bed_id)
+        if commands and self.sequencer.active_run() is None:
+            bed_id = commands[0]
+            clear_commands(self._store, COMMAND_KEY)
+            for remaining in commands[1:]:
+                append_command(self._store, COMMAND_KEY, remaining)
+            self.sequencer.begin(bed_id)
         return commands
 
     def recover(self) -> None:
-        """Discard commands left over from a filter that already recovered."""
+        """Discard operator requests; an active run itself is journaled."""
 
         clear_commands(self._store, COMMAND_KEY)
 
@@ -58,6 +116,8 @@ class Controller:
 
     def pending_count(self) -> int:
         return len(self.command_list())
+
+    # -- bank organisation -------------------------------------------------
 
     def select(self, zone: int) -> str:
         """Resolve the bed that currently occupies a zone."""
@@ -78,28 +138,59 @@ class Controller:
     def eligible(self) -> list[str]:
         return [bed.id for bed in self._bank.beds() if not bed.closed]
 
+    # -- drain markers (mirror of confirmed physical state) ----------------
+
     def drains(self) -> list[str]:
         drains: list[str] = []
         for key in self._store.keys():
             if key.startswith(DRAIN_KEY_PREFIX):
                 drains.append(key[len(DRAIN_KEY_PREFIX) :])
-        return drains
+        return sorted(drains)
 
     def drain_count(self) -> int:
         return len(self.drains())
 
     def last_drain(self) -> str | None:
         drains = self.drains()
-        if not drains:
-            return None
-        return drains[-1]
+        return drains[-1] if drains else None
 
     def spilled(self) -> bool:
-        return self._store.get(SPILL_KEY)[1]
+        """A spill marker is only ever present from pre-sequencer builds."""
+
+        raw, present = self._store.get(SPILL_KEY)
+        return present and raw == "true"
+
+    def current_step(self):
+        """Projection of the step an active run is parked on, or None."""
+
+        run = self.sequencer.active_run()
+        if run is None:
+            return None
+        step = self.sequencer.current_step()
+        if step is None:
+            return {"index": run.step_index, "name": "", "reason": ""}
+        return {
+            "index": step.index,
+            "name": step.name,
+            "reason": step.reason,
+            "hold_seconds": step.hold_seconds,
+            "clearwell_guarded": step.clearwell_guarded,
+        }
 
     def state(self) -> BackwashState:
-        return BackwashState(commands=self.command_list(), drains=self.drains())
+        run = self.sequencer.active_run()
+        return BackwashState(
+            commands=self.command_list(),
+            drains=self.drains(),
+            run=run.as_dict() if run is not None else None,
+            history=self.run_history(),
+        )
 
     def describe(self) -> str:
         state = self.state()
-        return f"backwash commands={len(state.commands)} drains={len(state.drains)}"
+        status = state.run["status"] if state.run else IDLE
+        step = state.run["step_index"] if state.run else "-"
+        return (
+            f"backwash status={status} step={step} "
+            f"commands={len(state.commands)} drains={len(state.drains)}"
+        )

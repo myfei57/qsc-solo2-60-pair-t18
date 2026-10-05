@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from waterplant.audit import Auditor
-from waterplant.backwash import Controller
+from waterplant.backwash import Controller, default_field
+from waterplant.backwash.clock import ManualClock
 from waterplant.chlor import Doser as ChlorDoser
 from waterplant.clearwell import Well
 from waterplant.coag import Doser as CoagDoser
@@ -31,7 +32,12 @@ class Runtime:
         self.coag_doser = coag_doser
         self.chlor_doser = ChlorDoser(store)
         self.bank = bank
-        self.backwash = Controller(bank, store)
+        # The console runs against a manually advanced simulation clock so the
+        # fixed wash/rinse hold durations can be exercised without real waits.
+        # Production wiring injects a SystemClock instead.
+        self.clock = ManualClock()
+        self.field = default_field()
+        self.backwash = Controller(bank, store, field=self.field, clock=self.clock)
         self.sampler = Sampler(coag_doser)
         self.calibration = Calibration(store)
         self.well = Well(store)

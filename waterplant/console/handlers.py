@@ -218,8 +218,136 @@ def filter_zone(server: "Server", request: Request) -> Response:
 
 def backwash_start(server: "Server", request: Request) -> Response:
     bed_id = request.str_field("id")
-    server.runtime.backwash.start(bed_id)
-    return json_response({"started": bed_id})
+    # Let the simulated field react to any outstanding commands, then evaluate.
+    server.runtime.field.pump()
+    run = server.runtime.backwash.start(bed_id)
+    return json_response(
+        {
+            "started": bed_id,
+            "run_id": run.run_id,
+            "status": run.status,
+            "step": run.step_index,
+            "reason": run.reason,
+            "detail": run.detail,
+            "current_step": server.runtime.backwash.current_step(),
+        }
+    )
+
+
+def backwash_pulse(server: "Server", request: Request) -> Response:
+    server.runtime.field.pump()
+    run = server.runtime.backwash.pulse()
+    return _run_payload(server, run)
+
+
+def backwash_tick(server: "Server", request: Request) -> Response:
+    """Advance the simulation clock, resample the field and re-evaluate.
+
+    ``seconds`` defaults to one scan interval. This is the operator-visible
+    "one control cycle" action: feedback gating and watchdog deadlines are all
+    judged against the (advanced) clock, but advancement still requires the
+    reported position -- the elapsed time never fakes completion.
+    """
+
+    seconds = request.float_field("seconds", 61.0)
+    if seconds < 0:
+        seconds = 61.0
+    server.runtime.clock.advance(seconds)
+    server.runtime.field.pump()
+    run = server.runtime.backwash.pulse()
+    return _run_payload(server, run)
+
+
+def backwash_resume(server: "Server", request: Request) -> Response:
+    server.runtime.field.pump()
+    run = server.runtime.backwash.resume()
+    return _run_payload(server, run)
+
+
+def backwash_resume_abort(server: "Server", request: Request) -> Response:
+    server.runtime.field.pump()
+    run = server.runtime.backwash.resume_abort()
+    return _run_payload(server, run)
+
+
+def backwash_reset(server: "Server", request: Request) -> Response:
+    server.runtime.backwash.reset()
+    return json_response({"reset": True, "status": server.runtime.backwash.status()})
+
+
+def backwash_state(server: "Server", request: Request) -> Response:
+    rt = server.runtime
+    run = rt.backwash.active_run()
+    return json_response(
+        {
+            "status": rt.backwash.status(),
+            "safe_level": rt.backwash.safe_level(),
+            "clearwell_level": rt.field.clearwell_level(),
+            "run": run.as_dict() if run is not None else None,
+            "current_step": rt.backwash.current_step(),
+            "devices": rt.field.bed_devices(run.bed_id) if run is not None else {},
+            "drains": rt.backwash.drains(),
+            "commands": rt.backwash.command_list(),
+        }
+    )
+
+
+def backwash_journal(server: "Server", request: Request) -> Response:
+    raw = request.payload.get("run_id")
+    run_id = str(raw) if raw not in (None, "") else None
+    events = server.runtime.backwash.journal(run_id)
+    return json_response({"count": len(events), "entries": events})
+
+
+def backwash_history(server: "Server", request: Request) -> Response:
+    runs = server.runtime.backwash.run_history()
+    return json_response({"count": len(runs), "runs": runs})
+
+
+def backwash_field_level(server: "Server", request: Request) -> Response:
+    level = request.float_field("level")
+    validate_level(level)
+    server.runtime.field.set_clearwell_level(level)
+    return json_response(
+        {
+            "level": level,
+            "safe_level": server.runtime.backwash.safe_level(),
+            "safe": level >= server.runtime.backwash.safe_level(),
+        }
+    )
+
+
+def backwash_field(server: "Server", request: Request) -> Response:
+    bed_id = request.str_field("id")
+    return json_response(
+        {
+            "id": bed_id,
+            "devices": server.runtime.field.bed_devices(bed_id),
+            "pumps": {
+                pump: {
+                    "commanded": server.runtime.field.pump_command(pump),
+                    "reported": server.runtime.field.pump_state(pump),
+                }
+                for pump in ("wash_pump", "air_blower")
+            },
+        }
+    )
+
+
+def _run_payload(server: "Server", run) -> Response:
+    return json_response(
+        {
+            "run_id": run.run_id,
+            "bed_id": run.bed_id,
+            "status": run.status,
+            "step": run.step_index,
+            "attempt": run.attempt,
+            "version": run.version,
+            "reason": run.reason,
+            "detail": run.detail,
+            "current_step": server.runtime.backwash.current_step(),
+        }
+    )
 
 
 def backwash_order(server: "Server", request: Request) -> Response:
@@ -246,6 +374,7 @@ def backwash_recover(server: "Server", request: Request) -> Response:
 
 
 def backwash_replay(server: "Server", request: Request) -> Response:
+    server.runtime.field.pump()
     return json_response({"replayed": server.runtime.backwash.replay()})
 
 
